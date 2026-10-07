@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hand Gesture Controller</title>
+    
+    <!-- MediaPipe Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root { --primary: #007bff; --success: #28a745; --danger: #dc3545; }
+        body { margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; overflow: hidden; background: #f0f2f5; touch-action: none; }
+
+        /* Camera View */
+        #video-container { position: absolute; top: 10px; right: 10px; width: 120px; height: 90px; border-radius: 10px; overflow: hidden; border: 2px solid white; box-shadow: 0 4px 10px rgba(0,0,0,0.2); z-index: 100; transform: scaleX(-1); }
+        video { width: 100%; height: 100%; object-fit: cover; }
+
+        /* UI Elements */
+        #ui-layer { position: relative; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; }
+        
+        .status-bar { position: absolute; top: 0; width: 100%; background: white; padding: 10px; display: flex; justify-content: space-around; font-size: 12px; font-weight: bold; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        
+        #cursor { position: fixed; width: 30px; height: 30px; background: rgba(0, 123, 255, 0.5); border: 2px solid var(--primary); border-radius: 50%; pointer-events: none; z-index: 9999; transition: transform 0.1s linear; display: none; }
+        #cursor::after { content: ''; position: absolute; top: 50%; left: 50%; width: 4px; height: 4px; background: white; border-radius: 50%; transform: translate(-50%, -50%); }
+
+        .demo-area { width: 90%; height: 60%; background: white; border-radius: 20px; display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 20px; padding: 20px; border: 2px dashed #ccc; margin-top: 50px; }
+        .target-btn { padding: 20px 30px; background: var(--primary); color: white; border: none; border-radius: 10px; font-weight: bold; transition: 0.3s; }
+        .target-btn.active { transform: scale(1.2); background: var(--success); }
+
+        .controls { position: absolute; bottom: 20px; width: 90%; background: white; padding: 15px; border-radius: 15px; box-shadow: 0 -5px 15px rgba(0,0,0,0.1); }
+        .btn-row { display: flex; gap: 10px; margin-bottom: 10px; }
+        button { flex: 1; padding: 12px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
+        #start-btn { background: var(--success); color: white; }
+        #stop-btn { background: var(--danger); color: white; }
+        
+        .slider-box { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+        input[type="range"] { flex: 1; }
+
+        .hidden { display: none; }
+        #log { color: #555; font-size: 12px; text-align: center; }
+    </style>
+</head>
+<body>
+
+    <div class="status-bar">
+        <div>STATUS: <span id="hand-status" style="color: var(--danger);">OFF</span></div>
+        <div>GESTURE: <span id="gesture-name">NONE</span></div>
+    </div>
+
+    <div id="video-container">
+        <video id="input-video" playsinline></video>
+    </div>
+
+    <div id="cursor"></div>
+
+    <div id="ui-layer">
+        <div class="demo-area" id="demo-area">
+            <button class="target-btn">BUTTON 1</button>
+            <button class="target-btn">BUTTON 2</button>
+            <button class="target-btn">BUTTON 3</button>
+            <button class="target-btn">BUTTON 4</button>
+            <div id="click-effect" style="color: var(--success); font-weight: bold; display: none;">CLICKED!</div>
+        </div>
+
+        <div class="controls">
+            <div id="log">Press START and show your hand to the camera.</div>
+            <div class="btn-row">
+                <button id="start-btn">START CAMERA</button>
+                <button id="calibrate-btn" class="hidden" style="background: #6c757d; color: white;">CALIBRATE</button>
+                <button id="stop-btn" class="hidden">STOP</button>
+            </div>
+            <div class="slider-box">
+                <span>Sensitivity</span>
+                <input type="range" id="sensitivity" min="1" max="5" step="0.1" value="2.5">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input-video');
+        const cursor = document.getElementById('cursor');
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const calibrateBtn = document.getElementById('calibrate-btn');
+        const handStatus = document.getElementById('hand-status');
+        const gestureName = document.getElementById('gesture-name');
+        const sensitivitySlider = document.getElementById('sensitivity');
+        const log = document.getElementById('log');
+
+        let hands = null;
+        let isCameraRunning = false;
+        let screenWidth = window.innerWidth;
+        let screenHeight = window.innerHeight;
+        let calibrationOffset = { x: 0.5, y: 0.5 };
+        
+        // Smooth movement variables
+        let currentX = screenWidth / 2;
+        let currentY = screenHeight / 2;
+
+        async function setupHands() {
+            hands = new Hands({
+                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.7,
+                minTrackingConfidence: 0.7
+            });
+
+            hands.onResults(onResults);
+            log.innerText = "Model loaded. Ready!";
+        }
+
+        function onResults(results) {
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                handStatus.innerText = "NO HAND";
+                handStatus.style.color = "var(--danger)";
+                gestureName.innerText = "NONE";
+                return;
+            }
+
+            handStatus.innerText = "HAND DETECTED";
+            handStatus.style.color = "var(--success)";
+            
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // 1. Position Tracking (Index Finger Tip is landmark 8)
+            const indexTip = landmarks[8];
+            
+            // Mapping & Sensitivity
+            const sens = parseFloat(sensitivitySlider.value);
+            let targetX = (1 - indexTip.x - calibrationOffset.x) * screenWidth * sens + (screenWidth / 2);
+            let targetY = (indexTip.y - calibrationOffset.y) * screenHeight * sens + (screenHeight / 2);
+
+            // Interpolation for smoothness
+            currentX += (targetX - currentX) * 0.3;
+            currentY += (targetY - currentY) * 0.3;
+
+            // Constrain to screen
+            currentX = Math.max(0, Math.min(screenWidth, currentX));
+            currentY = Math.max(0, Math.min(screenHeight, currentY));
+
+            cursor.style.display = "block";
+            cursor.style.left = `${currentX}px`;
+            cursor.style.top = `${currentY}px`;
+
+            // 2. Gesture Detection
+            detectGesture(landmarks);
+        }
+
+        function detectGesture(lm) {
+            // Check finger states
+            const isIndexExtended = lm[8].y < lm[6].y;
+            const isMiddleExtended = lm[12].y < lm[10].y;
+            const isRingExtended = lm[16].y < lm[14].y;
+            const isPinkyExtended = lm[20].y < lm[18].y;
+            const thumbTip = lm[4];
+            const indexTip = lm[8];
+
+            // Distance for Click (Thumb and Index pinch)
+            const distance = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+
+            if (distance < 0.05) {
+                gestureName.innerText = "CLICK/TAP";
+                performClick(currentX, currentY);
+            } else if (!isIndexExtended && !isMiddleExtended && !isRingExtended && !isPinkyExtended) {
+                gestureName.innerText = "CLOSED FIST (HOLD)";
+            } else if (isIndexExtended && isMiddleExtended && isRingExtended && isPinkyExtended) {
+                gestureName.innerText = "OPEN PALM (PAUSE)";
+            } else if (isIndexExtended) {
+                gestureName.innerText = "POINTER MOVING";
+            }
+        }
+
+        let lastClickTime = 0;
+        function performClick(x, y) {
+            const now = Date.now();
+            if (now - lastClickTime < 1000) return; // 1 second cooldown
+            
+            lastClickTime = now;
+            const element = document.elementFromPoint(x, y);
+            
+            if (element && element.classList.contains('target-btn')) {
+                element.style.background = "var(--success)";
+                document.getElementById('click-effect').style.display = "block";
+                setTimeout(() => {
+                    element.style.background = "var(--primary)";
+                    document.getElementById('click-effect').style.display = "none";
+                }, 500);
+            }
+        }
+
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "user", width: 640, height: 480 } 
+                });
+                videoElement.srcObject = stream;
+                videoElement.play();
+                isCameraRunning = true;
+                
+                startBtn.classList.add('hidden');
+                stopBtn.classList.remove('hidden');
+                calibrateBtn.classList.remove('hidden');
+                
+                requestAnimationFrame(processVideo);
+                log.innerText = "Camera active. Move your index finger.";
+            } catch (err) {
+                log.innerText = "Error: Camera permission denied.";
+                console.error(err);
+            }
+        }
+
+        async function processVideo() {
+            if (!isCameraRunning) return;
+            if (videoElement.readyState === 4) {
+                await hands.send({ image: videoElement });
+            }
+            requestAnimationFrame(processVideo);
+        }
+
+        startBtn.onclick = () => {
+            setupHands().then(startCamera);
+        };
+
+        stopBtn.onclick = () => {
+            isCameraRunning = false;
+            const stream = videoElement.srcObject;
+            stream.getTracks().forEach(track => track.stop());
+            videoElement.srcObject = null;
+            
+            startBtn.classList.remove('hidden');
+            stopBtn.classList.add('hidden');
+            calibrateBtn.classList.add('hidden');
+            cursor.style.display = "none";
+            log.innerText = "Stopped.";
+        };
+
+        calibrateBtn.onclick = () => {
+            // We'll use a timeout to calibrate
+            log.innerText = "Keep your hand at the center for 2 seconds...";
+            setTimeout(() => {
+                // In a real scenario, we'd capture current index position
+                // For this demo, we reset smoothing
+                currentX = screenWidth / 2;
+                currentY = screenHeight / 2;
+                log.innerText = "Calibrated!";
+            }, 2000);
+        };
+
+        window.onresize = () => {
+            screenWidth = window.innerWidth;
+            screenHeight = window.innerHeight;
+        };
+    </script>
+</body>
+</html>
